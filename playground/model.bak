@@ -1,0 +1,105 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+n_embed = 32  # size of the embed vector(C)
+window_size = 8  # block size, number of examples in each batch
+dropout = 0.2
+
+
+"""
+First we need to get things clear. I mean the structure of the network or sth.
+
+Input
+Say we have a token sequence to go in, we chunk it to window_size tokens, each token has the size n_embed.
+So the input shall be (B, T, C), T is time - window_size, C is channel - n_embed
+
+Attention Head
+In each head, we're gonna have q, k, v.
+We use q @ k to find the attention weights, and then use the masked and normalized attention weights to attend to the v.
+The output of each head is (B, T, head_size), and we have n_heads of them.
+
+MultiHeadAttention
+We concat the outputs of the n_heads, and then use a linear layer to project the concatenated output to the n_embed.
+
+FeedForward
+We use a linear layer to project the input to the n_embed, and then use a ReLU activation function to activate the output.
+"""
+
+
+class Head(nn.Module):
+
+    def __init__(self, head_size):
+        super().__init__()
+        self.head_size = head_size
+        self.query = nn.Linear(n_embed, head_size)
+        self.key = nn.Linear(n_embed, head_size)
+        self.value = nn.Linear(n_embed, head_size)
+        self.register_buffer("tril", torch.tril(torch.ones(window_size, window_size)))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # x -> (B, T, C) batch, time, channels
+        q = self.query(x)  # (B, T, head_size)
+        k = self.key(x)    # (B, T, head_size)
+        v = self.value(x)  # (B, T, head_size)
+        wei = q @ k.transpose(-2, -1) * self.head_size ** 0.5  # (B, T, T)
+        wei = wei.masked_fill(self.tril[:window_size, :window_size] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)  # (B, T, T)
+        wei = self.dropout(wei)
+        out = wei @ v  # (B, T, head_size)
+        return out
+
+
+class MultiHeadAttention(nn.Module):
+
+    def __init__(self, n_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+        self.proj = nn.Linear(n_heads * head_size, n_embed)  # shape back to (B, T, n_embed)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = torch.cat([head(x) for head in self.heads], dim=-1)
+        x = self.dropout(self.proj(x))
+        return x
+
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout)
+        )
+
+
+class Block(nn.Module):
+
+    def __init__(self, n_heads, head_size):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.mha = MultiHeadAttention(n_heads, head_size)
+        self.ln2 = nn.LayerNorm(n_embed)
+        self.ff = FeedForward(n_embed)
+
+    def forward(self, x):
+        # w/ residual connection
+        x = x + self.mha(self.ln1(x))
+        x = x + self.ff(self.ln2(x))
+        return x
+
+
+class Transformer(nn.Module):
+
+    def __init__(self, n_heads, head_size):
+        super().__init__()
+        self.blocks = nn.ModuleList([Block(n_heads, head_size) for _ in range(n_blocks)])
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
+
